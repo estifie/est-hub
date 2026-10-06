@@ -9,8 +9,9 @@ yanked = "warn"
 version = 2
 # MIT/Apache-2.0: the EST default. BSD-3-Clause: matchit (axum).
 # Zlib: foldhash (hashbrown, rusqlite). Unicode-3.0: ICU (idna, url).
-# All four are OSI-approved permissive; anything copyleft still denies.
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
+# ISC: ring/webpki (rustls, reqwest). All OSI-approved permissive;
+# anything copyleft still denies.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Zlib", "Unicode-3.0", "ISC"]
 
 [licenses.private]
 ignore = true

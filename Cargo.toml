@@ -24,9 +24,10 @@ tokio = { version = "1", features = ["macros", "net", "rt", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Plain HTTP only: the tailnet is the encryption. A TLS feature lands
-# with the first https call the hub makes (APNs, P4).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# The hub serves plain HTTP (the tailnet is the encryption) but probes
+# the world's https URLs, so the client carries rustls: pure Rust, no
+# system TLS libs on any platform it builds on.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [lints.rust]
 unsafe_code = "forbid"
