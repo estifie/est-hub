@@ -7,7 +7,10 @@ yanked = "warn"
 
 [licenses]
 version = 2
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+# MIT/Apache-2.0: the EST default. BSD-3-Clause: matchit (axum).
+# Zlib: foldhash (hashbrown, rusqlite). Unicode-3.0: ICU (idna, url).
+# All four are OSI-approved permissive; anything copyleft still denies.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
 
 [licenses.private]
 ignore = true
