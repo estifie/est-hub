@@ -2,11 +2,14 @@
 //!
 //! Phones, desktops, daemons, scripts, and agents all talk to the same
 //! routes ([`api`]) over the same versioned JSON envelopes; state lives
-//! in one SQLite file ([`db`]). The hub holds operational state only —
-//! it never sees the vault master key.
+//! in one SQLite file ([`db`]); shapes and validation live in [`model`];
+//! the hub's own prober is [`probe`]. The hub holds operational state
+//! only — it never sees the vault master key.
 
 pub mod api;
 pub mod db;
+pub mod model;
+pub mod probe;
 
 /// The running crate version, reported by `/ping`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -28,8 +28,10 @@ Deploy binds the tailnet IP on port `18925`, never `0.0.0.0`.
 
 | Module | Purpose |
 |---|---|
-| `api` | Routes and versioned JSON envelopes |
-| `db` | The SQLite store: open, WAL, tables |
+| `api` | Routes, versioned envelopes, the served registry |
+| `db` | The SQLite store: tables, record/flip, approvals |
+| `model` | Shapes and validation, shared by API and CLI |
+| `probe` | The hub's own prober: fetch url/api, judge heartbeats |
 
 ## Develop
 
