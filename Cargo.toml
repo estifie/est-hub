@@ -1,0 +1,38 @@
+[package]
+name = "est-hub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "The EST ecosystem hub: one API on the tailnet for health, devices, approvals, and notifications."
+repository = "https://github.com/estifie/est-hub"
+license = "MIT OR Apache-2.0"
+keywords = ["est", "health", "hub", "api"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[lib]
+name = "est_hub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "est-hub"
+path = "src/main.rs"
+
+[dependencies]
+est-core = { git = "https://github.com/estifie/est-core", tag = "v0.1.0" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Plain HTTP only: the tailnet is the encryption. A TLS feature lands
+# with the first https call the hub makes (APNs, P4).
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[profile.dev]
+# Line tables only: backtraces keep working, full debuginfo (the bulk of
+# dev artifacts) stays out of the shared target dir.
+debug = "line-tables-only"

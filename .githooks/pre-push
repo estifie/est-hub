@@ -1,0 +1,5 @@
+#!/bin/sh
+# EST pre-push: the full local gate. CI runs the same plus supply chain.
+set -eu
+cargo clippy --all-targets -- -D warnings
+cargo test

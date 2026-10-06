@@ -1,0 +1,6 @@
+# All EST checkouts in one folder share the sibling `.target` directory,
+# so dependencies compile once no matter how many EST repos are open.
+# Plain `cargo clean` wipes that shared dir (safe: everything rebuilds);
+# use `cargo clean -p <pkg>` to prune a single crate.
+[build]
+target-dir = "../.target"

@@ -1,0 +1,25 @@
+# version = 2: modern advisories/license checks. Advisory lints default
+# to deny (vulnerability, unmaintained, unsound, notice); yanked stays
+# a warning. Unlisted licenses deny; unlicensed crates deny.
+[advisories]
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# "warn" until est-core publishes: the rev-pinned git dep reads as a
+# wildcard to deny, with no per-crate exception. Back to "deny" with
+# the registry version.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/estifie/est-core"]

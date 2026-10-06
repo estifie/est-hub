@@ -1,0 +1,4 @@
+#!/bin/sh
+# EST pre-commit: formatting only — fast enough to never skip.
+set -eu
+cargo fmt --all -- --check
