@@ -14,6 +14,7 @@ use std::time::Duration;
 pub struct Hub {
     child: Child,
     pub addr: String,
+    pub dir: std::path::PathBuf,
 }
 
 impl Hub {
@@ -21,9 +22,10 @@ impl Hub {
         let dir = std::env::temp_dir().join(format!("est-hub-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_est-hub"))
-            .args(["serve", "--port", "0", "--db"])
-            .arg(dir.join("hub.sqlite"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_est-hub"));
+        cmd.args(["serve", "--port", "0", "--db"])
+            .arg(dir.join("hub.sqlite"));
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -42,7 +44,7 @@ impl Hub {
         let value: serde_json::Value = serde_json::from_str(&line).expect("not JSON");
         assert_eq!(value["ok"], true);
         let addr = value["listening"].as_str().unwrap().to_string();
-        Hub { child, addr }
+        Hub { child, addr, dir }
     }
 
     pub fn url(&self, path: &str) -> String {

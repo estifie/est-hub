@@ -27,7 +27,14 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # The hub serves plain HTTP (the tailnet is the encryption) but probes
 # the world's https URLs, so the client carries rustls against the OS
 # trust store: pure Rust, no system TLS libs, no bundled CA data.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"] }
+# Part 3: ES256 provider JWTs for the APNs sender (`src/apns.rs`). One
+# C backend (aws-lc) — `jsonwebtoken` (ring) stays out.
+aws-lc-rs = "1"
+# Randomness and hashes: fingerprints, throttle keys, secret tokens.
+getrandom = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
 
 [lints.rust]
 unsafe_code = "forbid"

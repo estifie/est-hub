@@ -14,6 +14,27 @@ pub fn valid_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
 }
 
+/// A herdr pane id (`w7:p1P`): short, no spaces, no slashes (it
+/// rides a path segment). Uppercase and `:` are legal here — this is
+/// deliberately wider than [`valid_name`].
+pub fn valid_pane(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=64).contains(&b.len())
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b':' || *c == b'_' || *c == b'-')
+}
+
+/// The five herdr lifecycle states, mirrored verbatim: the hub stores
+/// what herdr reports, never its own vocabulary.
+pub fn valid_agent_status(s: &str) -> bool {
+    matches!(s, "working" | "done" | "idle" | "blocked" | "unknown")
+}
+
+/// Past this many quiet seconds an agent row reads `stale` (the
+/// watcher pushes every ~15s; ten silent minutes means it is dead,
+/// not the agent). Display-only — stale never pages.
+pub const AGENT_STALE_AFTER_SECS: u64 = 600;
+
 fn valid_url(s: &str) -> bool {
     (s.starts_with("http://") || s.starts_with("https://"))
         && s.len() <= 2048
@@ -22,17 +43,81 @@ fn valid_url(s: &str) -> bool {
 
 // ---------------------------------------------------------------- devices
 
-/// A known device. Registry only until mTLS (P3) enforces it.
-#[derive(Serialize, Clone)]
+/// A known device. Access is Tailscale membership, so a device is just
+/// a name plus whatever push state the app has reported.
+#[derive(Clone)]
 pub struct Device {
     /// Device address, `[a-z][a-z0-9_-]{0,31}`.
     pub name: String,
-    /// X25519 public key (base64), once pairing issues it.
-    pub pubkey: Option<String>,
     /// APNs device token, once the app registers it.
     pub apns_token: Option<String>,
-    /// When it paired, unix seconds.
+    /// When it first registered, unix seconds.
     pub created_ts: u64,
+    /// Always `active` (kept so legacy rows read uniformly).
+    pub state: String,
+    /// `development` or `production`, once the app reports it.
+    pub apns_env: Option<String>,
+    /// Per-device `apns-topic` override (a bundle id); `None` reads the
+    /// hub-wide `apns.topic` from `meta`. Bundle ids are public.
+    pub apns_topic: Option<String>,
+    /// Push-to-start token, once the app reports it. Hub-only (it starts
+    /// activities), so never serialized — like `apns_token`.
+    pub la_pts_token: Option<String>,
+    /// Live Activity feed config as JSON ([`LaConfig`]); `None` reads
+    /// the default (off). Never serialized; the live-activity routes
+    /// serve the parsed shape instead.
+    pub la_config: Option<String>,
+    /// The current Live Activity id, once the app reports its token.
+    /// Never serialized.
+    pub la_activity_id: Option<String>,
+    /// When the current activity started, unix seconds. Never serialized.
+    pub la_started_ts: Option<u64>,
+}
+
+/// Ack quiets the down page this long unless the check recovers first
+/// (recovery clears the ack and always buzzes, unless muted).
+pub const ACK_DEFAULT_SECS: u64 = 2 * 3600;
+/// Ack never outlives a day: a forgotten ack must not hide an outage.
+pub const ACK_MAX_SECS: u64 = 24 * 3600;
+/// Mute quiets both directions this long unless told otherwise.
+pub const MUTE_DEFAULT_SECS: u64 = 24 * 3600;
+/// Mute never outlives a month: silence must be re-earned.
+pub const MUTE_MAX_SECS: u64 = 30 * 86400;
+
+impl Device {
+    /// True when a non-empty APNs token is stored. Clients read this
+    /// bit; only the hub ever needs the token itself.
+    pub fn apns_configured(&self) -> bool {
+        self.apns_token.as_deref().is_some_and(|t| !t.is_empty())
+    }
+
+    /// The parsed Live Activity config: stored JSON, or the default
+    /// when unset or unreadable (a corrupt row reads off, never loud).
+    pub fn la_config_parsed(&self) -> LaConfig {
+        self.la_config
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
+    }
+}
+
+// Manual so serialization carries the derived `apns_configured` bit
+// beside the stored fields (additive: every old field keeps its shape).
+// The `la_*` fields stay out: the PTS token is hub-only, and the rest
+// rides the live-activity routes, not the device object.
+impl Serialize for Device {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("Device", 7)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("apns_token", &self.apns_token)?;
+        st.serialize_field("created_ts", &self.created_ts)?;
+        st.serialize_field("state", &self.state)?;
+        st.serialize_field("apns_env", &self.apns_env)?;
+        st.serialize_field("apns_topic", &self.apns_topic)?;
+        st.serialize_field("apns_configured", &self.apns_configured())?;
+        st.end()
+    }
 }
 
 /// What `POST /devices` takes.
@@ -40,35 +125,100 @@ pub struct Device {
 pub struct NewDevice {
     /// Device address (required).
     pub name: Option<String>,
-    /// X25519 public key, if known yet.
-    pub pubkey: Option<String>,
     /// APNs device token, if known yet.
     pub apns_token: Option<String>,
 }
 
-/// Name plus optional keys, or why the device is unacceptable.
-pub fn validate_device(d: &NewDevice) -> Result<(String, Option<String>, Option<String>), String> {
+/// Name plus optional token, or why the device is unacceptable.
+pub fn validate_device(d: &NewDevice) -> Result<(String, Option<String>), String> {
     let name = d.name.as_deref().unwrap_or("").trim();
     if !valid_name(name) {
         return Err("name must match [a-z][a-z0-9_-]{0,31}".to_string());
     }
-    for (label, v) in [("pubkey", &d.pubkey), ("apns_token", &d.apns_token)] {
-        if v.as_deref().unwrap_or("").len() > 512 {
-            return Err(format!("{label} is too long (512 max)"));
-        }
+    if d.apns_token.as_deref().unwrap_or("").len() > 512 {
+        return Err("apns_token is too long (512 max)".to_string());
     }
     Ok((
         name.to_string(),
-        d.pubkey.clone().filter(|s| !s.trim().is_empty()),
         d.apns_token.clone().filter(|s| !s.trim().is_empty()),
     ))
+}
+
+// ---------------------------------------------------------------- live activity
+
+/// The default `min_severity`: `low`, so every severity passes.
+fn default_min_severity() -> String {
+    "low".to_string()
+}
+
+/// Serde default for the toggles that start on.
+fn default_true() -> bool {
+    true
+}
+
+/// One device's Live Activity feed: which checks the hub watches for
+/// it, how severe they must be to count, and how loud to be. Stored as
+/// one JSON blob on the device row; unset reads the default (off, so
+/// no pushes until the owner opts in).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LaConfig {
+    /// Master switch. Off until set — the hub never pushes uninvited.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Feed: `None` watches every check, `Some` watches exactly these.
+    /// Writes normalize an empty list to `None` (the app sends [] for
+    /// its "All checks" toggle), so `Some` is never empty on disk.
+    #[serde(default)]
+    pub checks: Option<Vec<String>>,
+    /// Floor severity: `low`, `normal`, or `high`. A down check counts
+    /// only at or above this (default `low` = everything counts).
+    #[serde(default = "default_min_severity")]
+    pub min_severity: String,
+    /// Fold pending approvals into the card's count (default on).
+    #[serde(default = "default_true")]
+    pub approvals: bool,
+    /// Buzz when a watched check goes down (default on). Recoveries
+    /// update silently; starts always alert (Apple requires it).
+    #[serde(default = "default_true")]
+    pub alert_on_down: bool,
+}
+
+impl Default for LaConfig {
+    fn default() -> Self {
+        LaConfig {
+            enabled: false,
+            checks: None,
+            min_severity: "low".to_string(),
+            approvals: true,
+            alert_on_down: true,
+        }
+    }
+}
+
+/// One reported Live Activity push token: the app starts (or resumes)
+/// an activity, then upserts its id + token here so hub pushes reach it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LaToken {
+    /// Apple's activity id (the row key).
+    pub activity_id: String,
+    /// The device that reported it.
+    pub device: String,
+    /// The activity push token (hub-only secret, never served).
+    pub push_token: String,
+    /// When reported, unix seconds.
+    pub updated_ts: u64,
+    /// Card kind: `""` for the status card, `incident:{check}` for an
+    /// incident card. Only status tokens move the device's activity
+    /// pointer — incident rows ride beside it, never through it.
+    pub label: String,
 }
 
 // ---------------------------------------------------------------- checks
 
 /// What a check probes. `url`/`api` are fetched by a runner; `heartbeat`
 /// is pushed by the reporter (missing beats read as down); `balance`
-/// compares a reported value against thresholds (evaluation lands P4).
+/// derives its answer from each reported value against `warn_below` /
+/// `crit_below` (evaluated on record).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CheckType {
     /// Plain URL probe: status plus optional body substring.
@@ -335,6 +485,10 @@ pub struct CheckState {
     pub last_beat: u64,
     /// Five-plus flips in the last hour.
     pub flapping: bool,
+    /// Numeric value of the latest result, when that result carried
+    /// one (`null` when it did not — a value never outlives the
+    /// result it came with).
+    pub last_value: Option<f64>,
 }
 
 /// A check with its live state: what `GET /checks` serves.
@@ -365,6 +519,230 @@ pub struct Check {
     pub created_ts: u64,
     /// Live state.
     pub state: CheckState,
+    /// Ack horizon, unix seconds (0 = none): the down page stays
+    /// quiet until this, or until recovery clears it — whichever
+    /// comes first.
+    pub ack_until: u64,
+    /// Mute horizon, unix seconds (0 = none): both directions stay
+    /// quiet until this. Nothing clears a mute but time or unmute.
+    pub mute_until: u64,
+}
+
+// ---------------------------------------------------------------- projects
+
+/// What `PUT /projects/{name}` takes: the Mac sync owns every key.
+/// Group and name ride every write; the bundle id is optional (not
+/// every project ships an app).
+#[derive(Deserialize, Default)]
+pub struct NewProject {
+    /// Display group (`ios`, ...).
+    pub group: Option<String>,
+    /// Human name.
+    pub name: Option<String>,
+    /// Bundle id, when the project has one.
+    pub bundle_id: Option<String>,
+}
+
+/// A project after validation, ready to store.
+pub struct ValidProject {
+    /// Project address (the app slug).
+    pub slug: String,
+    /// Display group.
+    pub group: String,
+    /// Human name.
+    pub name: String,
+    /// Bundle id (`""` when none).
+    pub bundle_id: String,
+}
+
+/// Every rule in one place, or the first refusal as a human line.
+pub fn validate_project(slug: &str, p: &NewProject) -> Result<ValidProject, String> {
+    let slug = slug.trim();
+    if !valid_name(slug) {
+        return Err("slug must match [a-z][a-z0-9_-]{0,31}".to_string());
+    }
+    let group = p.group.as_deref().unwrap_or("").trim();
+    if group.is_empty() || group.len() > 32 {
+        return Err("group names the display group (1-32 chars)".to_string());
+    }
+    let name = p.name.as_deref().unwrap_or("").trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err("name is the human name (1-128 chars)".to_string());
+    }
+    let bundle_id = p.bundle_id.as_deref().unwrap_or("").trim();
+    if bundle_id.len() > 128 {
+        return Err("bundle_id is 128 max".to_string());
+    }
+    Ok(ValidProject {
+        slug: slug.to_string(),
+        group: group.to_string(),
+        name: name.to_string(),
+        bundle_id: bundle_id.to_string(),
+    })
+}
+
+/// A stored project: ecosystem metadata the Mac sync owns. Health
+/// rolls up at serve time (owner == slug), so this stores no status —
+/// only identity plus the icon bytes.
+#[derive(Serialize, Clone)]
+pub struct Project {
+    /// Project address.
+    pub slug: String,
+    /// Display group.
+    pub group: String,
+    /// Human name.
+    pub name: String,
+    /// Bundle id (`""` when none).
+    pub bundle_id: String,
+    /// True when icon bytes are stored.
+    pub has_icon: bool,
+    /// sha256 hex of the icon, when one is stored (sync skips re-upload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_sha256: Option<String>,
+    /// Last metadata/icon write, unix seconds.
+    pub updated_ts: u64,
+}
+
+/// Health rollup over one project's checks.
+#[derive(Serialize, Clone)]
+pub struct ProjectHealth {
+    /// Checks currently up.
+    pub up: u32,
+    /// Checks currently down.
+    pub down: u32,
+    /// Checks never probed (or unreadable).
+    pub unknown: u32,
+    /// All three.
+    pub total: u32,
+}
+
+/// One project's env blob, cap: 64KB covers any `.env` without
+/// inviting binary dumps.
+pub const SECRET_ENV_MAX: usize = 65536;
+
+/// Project-token prefix: `est_s_…` reads as a secret at a glance
+/// (and greps out of logs when it leaks into one).
+pub const SECRET_TOKEN_PREFIX: &str = "est_s_";
+
+/// A stored secret's public face: identity plus the sha deploys
+/// compare — the env itself only ever leaves via a tokened pull.
+#[derive(Serialize, Clone)]
+pub struct SecretMeta {
+    /// Project address (the deploy slug).
+    pub project: String,
+    /// sha256 hex of the stored env (deploys skip unchanged writes).
+    pub sha: String,
+    /// Last push, unix seconds.
+    pub updated_ts: u64,
+    /// True when a pull token is minted for this project.
+    pub has_token: bool,
+}
+
+/// One API balance row: a display amount plus when it was read.
+/// Amounts are strings (`"$12.34"`, `"84%"`) — providers format
+/// variously, and the hub displays, never computes.
+#[derive(Serialize, Clone)]
+pub struct Balance {
+    /// Provider key (`openai`, `anthropic`, …).
+    pub provider: String,
+    /// Human label (defaults to the provider).
+    pub label: String,
+    /// Display amount.
+    pub amount: String,
+    /// Currency/unit hint (`USD`, `%`, `credits`).
+    pub currency: String,
+    /// Free note (plan, reset date, …).
+    pub note: String,
+    /// When read, unix seconds.
+    pub updated_ts: u64,
+}
+
+/// One herdr agent snapshot: the mirror of what herdr shows —
+/// title, directory, lifecycle state, workspace/tab placing, last
+/// output, and when the watcher last saw it. `stale` is computed at
+/// serve time (never stored).
+#[derive(Serialize, Clone)]
+pub struct Agent {
+    /// herdr pane id (`w7:p1P`), the row key.
+    pub pane: String,
+    /// Stripped terminal title (`EST Hub App Delivery`).
+    pub title: String,
+    /// Working directory of the agent.
+    pub cwd: String,
+    /// One of `working|done|idle|blocked|unknown`.
+    pub status: String,
+    /// herdr workspace label (`iOS`, `EST`), 64 max.
+    pub space: String,
+    /// herdr tab label inside the space, 64 max.
+    pub tab: String,
+    /// Tail of the pane's recent output (~2KB), 4096 max.
+    pub output: String,
+    /// Last watcher push, unix seconds.
+    pub updated_ts: u64,
+    /// True past [`AGENT_STALE_AFTER_SECS`] quiet seconds.
+    pub stale: bool,
+    /// When the status last flipped, unix seconds (the row's elapsed
+    /// clock — the app's "working 12m" reads this, not `updated_ts`).
+    pub status_since_ts: u64,
+}
+
+/// One fleet-card row: the pane, its display name (title, cwd leaf,
+/// pane — the app's `displayTitle` order), and herdr's own status
+/// verb. Serialized into the card's content state, never served.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct FleetRow {
+    /// herdr pane id, the row key.
+    pub pane: String,
+    /// Display name (title, cwd leaf, pane).
+    pub name: String,
+    /// herdr's own status verb.
+    pub status: String,
+}
+
+/// A project with its live rollup: what the project GETs serve. Flat
+/// (not nested): the app binds rows straight to it.
+#[derive(Serialize, Clone)]
+pub struct ProjectLive {
+    /// The stored identity.
+    #[serde(flatten)]
+    pub project: Project,
+    /// The rollup over owner == slug.
+    pub health: ProjectHealth,
+    /// `up`, `down`, or `unknown` (down wins, then unknown, then up;
+    /// zero checks reads unknown).
+    pub state: String,
+}
+
+impl Project {
+    /// Roll this project's checks (owner == slug) into its live shape.
+    pub fn live(&self, checks: &[Check]) -> ProjectLive {
+        let (mut up, mut down, mut unknown) = (0u32, 0u32, 0u32);
+        for c in checks.iter().filter(|c| c.owner == self.slug) {
+            match c.state.status.as_str() {
+                "up" => up += 1,
+                "down" => down += 1,
+                _ => unknown += 1,
+            }
+        }
+        let total = up + down + unknown;
+        let state = if down > 0 {
+            "down"
+        } else if total == 0 || unknown > 0 {
+            "unknown"
+        } else {
+            "up"
+        };
+        ProjectLive {
+            project: self.clone(),
+            health: ProjectHealth {
+                up,
+                down,
+                unknown,
+                total,
+            },
+            state: state.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- results
@@ -382,6 +760,24 @@ pub struct NewResult {
     pub reason: Option<String>,
     /// Probe time; now when absent (lets runners backfill).
     pub ts: Option<u64>,
+    /// Numeric reading (optional): disk/mem percent, load score, TLS
+    /// days-left. Absent or `null` means no value; a JSON number must
+    /// be finite, anything else is a 400.
+    pub value: Option<serde_json::Value>,
+}
+
+/// Validate the optional `value` on a result report: absent or `null`
+/// reads `None`; a finite JSON number reads `Some`; anything else
+/// (strings, bools, non-finite) refuses with a human line.
+pub fn parse_result_value(v: Option<&serde_json::Value>) -> Result<Option<f64>, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => match n.as_f64() {
+            Some(f) if f.is_finite() => Ok(Some(f)),
+            _ => Err("value is a finite JSON number or null".to_string()),
+        },
+        Some(_) => Err("value is a finite JSON number or null".to_string()),
+    }
 }
 
 /// One recorded probe.
@@ -399,6 +795,8 @@ pub struct StoredResult {
     pub code: Option<u16>,
     /// Human reason.
     pub reason: String,
+    /// Numeric reading, when the probe carried one.
+    pub value: Option<f64>,
 }
 
 // ---------------------------------------------------------------- approvals
@@ -548,19 +946,118 @@ mod tests {
         assert!(validate_check(&c).is_err());
     }
 
+    fn device_with_token(token: Option<&str>) -> Device {
+        Device {
+            name: "phone".to_string(),
+            apns_token: token.map(str::to_string),
+            created_ts: 1_700_000_000,
+            state: "active".to_string(),
+            apns_env: Some("production".to_string()),
+            apns_topic: None,
+            la_pts_token: None,
+            la_config: None,
+            la_activity_id: None,
+            la_started_ts: None,
+        }
+    }
+
+    #[test]
+    fn apns_configured_tracks_a_non_empty_token() {
+        assert!(device_with_token(Some("tok")).apns_configured());
+        assert!(!device_with_token(None).apns_configured());
+        assert!(!device_with_token(Some("")).apns_configured());
+    }
+
+    #[test]
+    fn devices_serialize_the_configured_bit() {
+        let v = serde_json::to_value(device_with_token(Some("tok"))).unwrap();
+        assert_eq!(v["apns_token"], "tok");
+        assert_eq!(v["apns_configured"], true);
+        // Stored fields keep their shape beside the bit.
+        assert_eq!(v["name"], "phone");
+        let v = serde_json::to_value(device_with_token(None)).unwrap();
+        assert!(v["apns_token"].is_null());
+        assert_eq!(v["apns_configured"], false);
+    }
+
+    #[test]
+    fn devices_serialize_topic_but_never_live_secrets() {
+        let mut d = device_with_token(Some("tok"));
+        d.apns_topic = Some("com.estifie.app2".to_string());
+        d.la_pts_token = Some("pts-secret".to_string());
+        d.la_config = Some(r#"{"enabled":true}"#.to_string());
+        d.la_activity_id = Some("act-1".to_string());
+        d.la_started_ts = Some(1_700_000_001);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["apns_topic"], "com.estifie.app2");
+        for key in [
+            "la_pts_token",
+            "la_config",
+            "la_activity_id",
+            "la_started_ts",
+        ] {
+            assert!(v.get(key).is_none(), "{v}");
+        }
+        assert!(!v.to_string().contains("pts-secret"));
+        // Unset topic serializes null, beside the configured bit.
+        let v = serde_json::to_value(device_with_token(None)).unwrap();
+        assert!(v["apns_topic"].is_null());
+        assert_eq!(v["apns_configured"], false);
+    }
+
+    #[test]
+    fn live_configs_default_off_and_parse_leniently() {
+        let fresh = device_with_token(None);
+        assert_eq!(fresh.la_config_parsed(), LaConfig::default());
+        assert!(!LaConfig::default().enabled);
+        assert_eq!(LaConfig::default().min_severity, "low");
+        assert!(LaConfig::default().approvals);
+        // Corrupt rows read off, never loud.
+        let mut d = device_with_token(None);
+        d.la_config = Some("not json".to_string());
+        assert_eq!(d.la_config_parsed(), LaConfig::default());
+        // Partial blobs fill the rest with defaults.
+        d.la_config = Some(r#"{"enabled":true}"#.to_string());
+        let parsed = d.la_config_parsed();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.checks, None);
+        assert_eq!(parsed.min_severity, "low");
+    }
+
     #[test]
     fn devices_need_names_only() {
         let d = NewDevice {
             name: Some("iphone".to_string()),
-            pubkey: None,
             apns_token: None,
         };
         assert!(validate_device(&d).is_ok());
         let d = NewDevice {
             name: Some("Nope!".to_string()),
-            pubkey: None,
             apns_token: None,
         };
         assert!(validate_device(&d).is_err());
+    }
+
+    #[test]
+    fn result_values_take_finite_numbers_or_null() {
+        assert_eq!(parse_result_value(None).unwrap(), None);
+        assert_eq!(
+            parse_result_value(Some(&serde_json::Value::Null)).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_result_value(Some(&serde_json::json!(42.5))).unwrap(),
+            Some(42.5)
+        );
+        assert_eq!(
+            parse_result_value(Some(&serde_json::json!(0))).unwrap(),
+            Some(0.0)
+        );
+        assert!(parse_result_value(Some(&serde_json::json!("42"))).is_err());
+        assert!(parse_result_value(Some(&serde_json::json!(true))).is_err());
+        assert!(parse_result_value(Some(&serde_json::json!([1]))).is_err());
+        // Non-finite has no JSON spelling: an overflow exponent does not
+        // even parse as JSON, so the transport refuses before validation.
+        assert!(serde_json::from_str::<serde_json::Value>("1e999").is_err());
     }
 }

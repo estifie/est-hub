@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""est-approve: ask the phone, wait for the answer.
+
+The blocking twin of `approvals request` for scripts that must not
+proceed without the operator: vault pushes, deploys, destructive
+one-offs. It asks (title + body ride a loud push with Approve/Reject
+actions and land answerable in the Approvals screen), then polls until
+the ask is decided, expired, or the wait runs out.
+
+Exit 0 means approved. Anything else is 1: rejected, expired, timed
+out waiting, or a hub error — callers branch on the code, never parse.
+
+  est-approve --title "Deploy backend v43?" --body "vps2, rolling" --ttl 600
+  est-approve --title "Rotate prod key?" --wait 120 || exit 1
+  est-approve --title "X" --dry-run  # prints the ask, asks nothing
+
+Runs anywhere with ssh to the hub (vault calls it from the Mac).
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+HUB = os.environ.get("EST_HUB_URL", "http://100.120.126.23:18925")
+SSH = os.environ.get("EST_HUB_SSH", "vps2")
+SSH_TIMEOUT_S = 30
+POLL_EVERY_S = 5
+
+
+def run(*args):
+    remote = " ".join(shlex.quote(a) for a in ("est-hub",) + args)
+    try:
+        out = subprocess.run(
+            ["ssh", "-n", SSH, remote], capture_output=True, text=True,
+            timeout=SSH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after {SSH_TIMEOUT_S}s"
+    return out.returncode, (out.stdout + out.stderr).strip()
+
+
+def ask(title, body, reply_to, ttl, dry_run):
+    if dry_run:
+        print(f"would ask: {title}" + (f" — {body}" if body else ""))
+        return 0
+    args = ["approvals", "request", "--title", title, "--json"]
+    if body:
+        args += ["--body", body]
+    if reply_to:
+        args += ["--reply-to", reply_to]
+    if ttl is not None:
+        args += ["--ttl", str(ttl)]
+    code, out = run(*args)
+    if code != 0:
+        print(f"est-approve: ask failed: {out}", file=sys.stderr)
+        return 1
+    try:
+        ask_id = json.loads(out)["approval"]["id"]
+    except (ValueError, KeyError, TypeError):
+        print(f"est-approve: unparseable ask: {out}", file=sys.stderr)
+        return 1
+    return wait(ask_id, ttl)
+
+
+def wait(ask_id, wait_secs):
+    deadline = time.time() + wait_secs
+    while True:
+        code, out = run("approvals", "show", str(ask_id), "--json")
+        if code != 0:
+            print(f"est-approve: show #{ask_id} failed: {out}", file=sys.stderr)
+            return 1
+        try:
+            row = json.loads(out)["approval"]
+            state = row.get("state", "")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            print(f"est-approve: unparseable ask #{ask_id}: {out}", file=sys.stderr)
+            return 1
+        if state == "approved":
+            by = row.get("decided_by", "") or "phone"
+            print(f"approved #{ask_id} by {by}")
+            return 0
+        if state in ("rejected", "expired"):
+            print(f"est-approve: #{ask_id} {state}")
+            return 1
+        if time.time() >= deadline:
+            print(f"est-approve: #{ask_id} still pending after {wait_secs}s")
+            return 1
+        time.sleep(min(POLL_EVERY_S, max(1, deadline - time.time())))
+
+
+def main():
+    title = None
+    body = ""
+    reply_to = ""
+    ttl = None
+    wait_secs = 600
+    dry_run = "--dry-run" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--dry-run"]
+    i = 0
+    while i < len(args):
+        if args[i] == "--title" and i + 1 < len(args):
+            title = args[i + 1]
+            i += 2
+        elif args[i] == "--body" and i + 1 < len(args):
+            body = args[i + 1]
+            i += 2
+        elif args[i] == "--reply-to" and i + 1 < len(args):
+            reply_to = args[i + 1]
+            i += 2
+        elif args[i] == "--ttl" and i + 1 < len(args):
+            try:
+                ttl = int(args[i + 1])
+            except ValueError:
+                print("est-approve: --ttl needs seconds", file=sys.stderr)
+                return 2
+            i += 2
+        elif args[i] == "--wait" and i + 1 < len(args):
+            try:
+                wait_secs = int(args[i + 1])
+            except ValueError:
+                print("est-approve: --wait needs seconds", file=sys.stderr)
+                return 2
+            i += 2
+        else:
+            print(f"est-approve: unexpected {args[i]!r} (try: --title T [--body B] [--reply-to R] [--ttl S] [--wait S] [--dry-run])",
+                  file=sys.stderr)
+            return 2
+    if not title:
+        print("est-approve: --title is required", file=sys.stderr)
+        return 2
+    return ask(title, body, reply_to, ttl, dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

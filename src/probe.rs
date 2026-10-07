@@ -21,20 +21,39 @@ fn fetch_reason(e: &reqwest::Error) -> String {
     format!("fetch failed: {e}")
 }
 
+/// What a probe flipped, when the serve loop needs to fan out (push
+/// plus Live Activity triggers ride this).
+pub struct ProbeFlip {
+    /// The check that flipped.
+    pub name: String,
+    /// True when it went down (false = recovered).
+    pub went_down: bool,
+    /// One human line for alert copy (`🔴 api is DOWN — refused`).
+    pub note: String,
+    /// The queued `health.flip` row the push delivers (`None` only
+    /// when the queue write itself failed).
+    pub row: Option<model::Notification>,
+}
+
 /// Probe one check by name: fetch or evaluate, record, log. Never
 /// panics, never fails the loop — a broken check definition records a
-/// failed probe instead of crashing the daemon.
-pub async fn probe_check(client: &reqwest::Client, db_path: &Path, name: &str) {
+/// failed probe instead of crashing the daemon. Returns the flip, when
+/// the probe flipped, so the loop can fan out to triggers.
+pub async fn probe_check(
+    client: &reqwest::Client,
+    db_path: &Path,
+    name: &str,
+) -> Option<ProbeFlip> {
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
             est_core::log::error(&format!("probe {name}: {e}"));
-            return;
+            return None;
         }
     };
     let check = match db::check_get(&conn, name) {
         Ok(c) => c,
-        Err(_) => return, // Deleted between ticks: nothing to do.
+        Err(_) => return None, // Deleted between ticks: nothing to do.
     };
     let now = model::now_epoch();
     let (ok, code, reason) = match check.ctype.as_str() {
@@ -45,7 +64,7 @@ pub async fn probe_check(client: &reqwest::Client, db_path: &Path, name: &str) {
             if check.state.last_beat == 0
                 && now.saturating_sub(check.created_ts) < check.config.miss_after_secs
             {
-                return;
+                return None;
             }
             let silent = now.saturating_sub(check.state.last_beat);
             if silent <= check.config.miss_after_secs {
@@ -54,20 +73,39 @@ pub async fn probe_check(client: &reqwest::Client, db_path: &Path, name: &str) {
                 (false, None, format!("no beat for {silent}s"))
             }
         }
-        _ => return, // balance and friends: evaluated elsewhere.
+        _ => return None, // balance and friends: evaluated elsewhere.
     };
-    match db::record_result(&conn, name, ok, code, &reason, now) {
-        Ok(flipped) => {
+    let (flipped, row) = match db::record_result(&conn, name, ok, code, &reason, now, None) {
+        Ok((flipped, row)) => {
             if flipped {
                 est_core::log::info(&format!(
                     "probe {name} flipped {}",
                     if ok { "up" } else { "down" }
                 ));
             }
+            (flipped, row)
         }
-        Err(e) => est_core::log::error(&format!("probe {name}: {e}")),
-    }
+        Err(e) => {
+            est_core::log::error(&format!("probe {name}: {e}"));
+            let _ = conn.close();
+            return None;
+        }
+    };
     let _ = conn.close();
+    if !flipped {
+        return None;
+    }
+    let note = if ok {
+        format!("🟢 {name} is back up")
+    } else {
+        format!("🔴 {name} is DOWN — {reason}")
+    };
+    Some(ProbeFlip {
+        name: name.to_string(),
+        went_down: !ok,
+        note,
+        row,
+    })
 }
 
 async fn fetch(client: &reqwest::Client, check: &model::Check) -> (bool, Option<u16>, String) {

@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""est-vps-health: host-scoped VPS metrics as hub checks (owner `sys`).
+
+Runs on each VPS from cron (every 5 min): reads disk/mem/load locally,
+ensures the `vps-<host>-disk|mem|load` heartbeat checks, and reports
+ok/fail with a numeric `value` plus the human reason. Missing beats page
+too (miss-after 20min), so a dead reporter reads down, not silent.
+
+Host scoping: `<host>` comes from `EST_VPS_HOST`, else the short
+hostname, lowercased — so a second host never overwrites the first.
+Check names are `vps-<host>-disk`, `vps-<host>-mem`, `vps-<host>-load`;
+`target` is `<host>`.
+
+Values (for gauges/trends; reasons keep their human wording):
+  disk = percent used, mem = percent used,
+  load = 100 * avg5 / ncpu.
+
+Needs only python3 stdlib plus reach to the hub's tailnet listener —
+it speaks the HTTP API directly, so reporting hosts need no `est-hub`
+binary.
+
+Thresholds are constants below.
+
+  EST_VPS_HOST=vps2 /usr/local/bin/est-vps-health
+  /usr/local/bin/est-vps-health --dry-run  # metrics only, no hub calls
+"""
+
+import json
+import os
+import socket
+import sys
+import urllib.request
+
+HUB = os.environ.get("EST_HUB_URL", "http://100.120.126.23:18925").rstrip("/")
+
+DISK_FAIL_USED_PCT = 90  # fail when / is fuller than this
+MEM_FAIL_AVAIL_PCT = 10  # fail when MemAvailable drops under this
+LOAD_FAIL_PER_CPU = 2.0  # fail when the 5m average tops ncpu * this
+
+
+def host_name():
+    """The host scope: `EST_VPS_HOST`, else the short hostname."""
+    env = os.environ.get("EST_VPS_HOST", "").strip().lower()
+    if env:
+        return env
+    short = socket.gethostname().split(".")[0].strip().lower()
+    return short or "vps"
+
+
+def check_name(host, metric):
+    return f"vps-{host}-{metric}"
+
+
+def api(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        HUB + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return res.status, res.read().decode()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode()
+        except Exception:
+            return e.code, ""
+    except Exception as e:
+        return 0, str(e)
+
+
+def ensure(name, host):
+    status, _ = api("GET", f"/checks/{name}")
+    if status == 200:
+        return True
+    status, err = api("POST", "/checks", {
+        "name": name, "type": "heartbeat", "target": host,
+        "owner": "sys", "every_secs": 600, "miss_after_secs": 1200,
+    })
+    if status not in (200, 201):
+        print(f"est-vps-health: ensure {name} failed: {err}", file=sys.stderr)
+        return False
+    return True
+
+
+def report(name, ok, reason, value):
+    status, err = api("POST", "/results", {
+        "check": name, "ok": ok, "reason": reason, "value": value,
+    })
+    if status not in (200, 201):
+        print(f"est-vps-health: report {name} failed: {err}", file=sys.stderr)
+        return False
+    status, err = api("POST", "/heartbeats", {"check": name})
+    if status not in (200, 201):
+        print(f"est-vps-health: beat {name} failed: {err}", file=sys.stderr)
+        return False
+    print(f"{name}: {'ok' if ok else 'FAIL'} — {reason}")
+    return True
+
+
+def disk_used_pct(total, free):
+    """Percent used from statvfs totals (pure, for tests)."""
+    if not total:
+        return 0.0
+    return 100.0 * (total - free) / total
+
+
+def disk():
+    st = os.statvfs("/")
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    used = disk_used_pct(total, free)
+    ok = used < DISK_FAIL_USED_PCT
+    return ok, f"disk {used:.0f}% used ({free // 1024**3}G free)", used
+
+
+def mem_used_pct(total, avail):
+    """Percent used from meminfo totals (pure, for tests)."""
+    if not total:
+        return 0.0
+    return 100.0 * (total - avail) / total
+
+
+def mem():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, v = line.partition(":")
+            num = v.strip().split(" ")
+            if len(num) >= 2 and num[1] == "kB":
+                info[k] = int(num[0]) * 1024
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", 0)
+    avail_pct = 100 * avail // total if total else 0
+    used = mem_used_pct(total, avail)
+    ok = avail_pct >= MEM_FAIL_AVAIL_PCT
+    return ok, f"mem {avail // 1024**2}M available ({avail_pct}%)", used
+
+
+def load_value(avg5, ncpu):
+    """Load score from a fixed 5m average and cpu count (pure)."""
+    return 100.0 * avg5 / (ncpu or 1)
+
+
+def load(avg5=None, ncpu=None):
+    if avg5 is None:
+        with open("/proc/loadavg") as f:
+            avg5 = float(f.read().split()[1])
+    if ncpu is None:
+        ncpu = os.cpu_count() or 1
+    value = load_value(avg5, ncpu)
+    ok = avg5 <= ncpu * LOAD_FAIL_PER_CPU
+    return ok, f"load {avg5:.2f} (5m, {ncpu} cpu)", value
+
+
+def collect():
+    """All metrics for this host: (name, ok, reason, value)."""
+    host = host_name()
+    out = []
+    for metric, probe in (("disk", disk), ("mem", mem), ("load", load)):
+        try:
+            ok, reason, value = probe()
+        except Exception as e:
+            ok, reason, value = False, f"{metric} read failed ({e})", None
+        out.append((check_name(host, metric), ok, reason, value))
+    return out
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    metrics = collect()
+    if dry_run:
+        for name, ok, reason, value in metrics:
+            extra = f" [value={value}]" if value is not None else ""
+            print(f"would report: {name} {'ok' if ok else 'FAIL'} — {reason}{extra}")
+        return 0
+    host = host_name()
+    failed = False
+    for name, ok, reason, value in metrics:
+        if not ensure(name, host) or not report(name, ok, reason, value):
+            failed = True
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""est-digest: the morning push — downs, backup, agents, overnight.
+
+Runs ON vps2 from cron (daily 06:00 UTC = 09:00 TRT): reads the hub
+over the tailnet URL and fires one broadcast `notify send`:
+
+  DOWN (2): ios-terms, api-auth
+  Backup: 14h ago (snapshot 2026-10-06)
+  Agents: 2 working (Release run-up, EST Hub), 1 needs input (Screenshots)
+  Overnight: 3 agents finished (Release run-up, …)
+
+  /usr/local/bin/est-digest            # compose + send
+  /usr/local/bin/est-digest --dry-run  # print, send nothing
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+HUB = os.environ.get("EST_HUB_URL", "http://100.120.126.23:18925")
+BIN = os.environ.get("EST_HUB_BIN", "est-hub")
+OVERNIGHT_SECS = 12 * 3600
+
+
+def hub(*args):
+    out = subprocess.run(
+        (BIN,) + args + ("--hub", HUB, "--json"),
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        print(f"est-digest: {' '.join(args)} failed: "
+              f"{(out.stdout + out.stderr).strip()}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError as e:
+        print(f"est-digest: {' '.join(args)} unparseable: {e}", file=sys.stderr)
+        return None
+
+
+def words(ts, now):
+    ago = max(0, now - ts)
+    if ago < 90:
+        return "just now"
+    if ago < 3600:
+        return f"{ago // 60}m ago"
+    if ago < 86400:
+        return f"{ago // 3600}h ago"
+    return f"{ago // 86400}d ago"
+
+
+def downs_line(checks, now):
+    downs = [c for c in checks if c.get("state", {}).get("status") == "down"]
+    if not downs:
+        return "DOWN: all quiet"
+    names = []
+    for c in downs[:6]:
+        name = c.get("name", "?")
+        if c.get("mute_until", 0) > now:
+            name += " (muted)"
+        names.append(name)
+    extra = f" +{len(downs) - 6} more" if len(downs) > 6 else ""
+    return f"DOWN ({len(downs)}): {', '.join(names)}{extra}"
+
+
+def backup_line(checks, now):
+    row = next((c for c in checks if c.get("name") == "backup-age"), None)
+    if row is None:
+        return "Backup: not reporting"
+    state = row.get("state", {})
+    reason = (state.get("last_reason", "") or "").strip()
+    age = words(state.get("last_ts", 0), now)
+    if state.get("status") != "up":
+        return f"Backup: STALE ({reason or 'no beat'})"
+    return f"Backup: {age}" + (f" ({reason})" if reason else "")
+
+
+def agent_name(a):
+    """Push identity, same order as the watcher: placing first, then
+    the title, then the pane."""
+    placing = " * ".join(
+        p for p in (a.get("space", "") or "", a.get("tab", "") or "") if p)
+    if placing:
+        return placing
+    return a.get("title", "") or a.get("pane", "?")
+
+
+def agents_line(agents):
+    working = [a for a in agents if a.get("status") == "working"]
+    blocked = [a for a in agents if a.get("status") == "blocked"]
+    if not working and not blocked:
+        return "Agents: idle"
+    parts = []
+    if working:
+        names = [agent_name(a) for a in working[:3]]
+        extra = f" +{len(working) - 3} more" if len(working) > 3 else ""
+        parts.append(f"{len(working)} working ({', '.join(names)}{extra})")
+    if blocked:
+        names = [agent_name(a) for a in blocked[:3]]
+        extra = f" +{len(blocked) - 3} more" if len(blocked) > 3 else ""
+        parts.append(f"{len(blocked)} needs input ({', '.join(names)}{extra})")
+    return "Agents: " + ", ".join(parts)
+
+
+def overnight_line(notifications, now):
+    done = []
+    for n in notifications or []:
+        if n.get("ts", 0) < now - OVERNIGHT_SECS:
+            continue
+        title = n.get("title", "") or ""
+        if title.endswith(" finished"):
+            done.append(title[: -len(" finished")])
+    if not done:
+        return "Overnight: nothing finished"
+    names = ", ".join(done[:3]) + (" +more" if len(done) > 3 else "")
+    return f"Overnight: {len(done)} finished ({names})"
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    now = int(time.time())
+    checks = hub("checks", "list")
+    agents = hub("agents", "list")
+    notes = hub("notifications", "list", "--limit", "100")
+    if checks is None or agents is None or notes is None:
+        return 1
+    body = "\n".join([
+        downs_line(checks.get("checks", []), now),
+        backup_line(checks.get("checks", []), now),
+        agents_line(agents.get("agents", [])),
+        overnight_line(notes.get("notifications", []), now),
+    ])
+    if dry_run:
+        print(f"title: ☀️ Morning digest\n{body}")
+        return 0
+    out = subprocess.run(
+        (BIN, "notify", "send", "--title", "☀️ Morning digest",
+         "--body", body, "--hub", HUB),
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        print(f"est-digest: send failed: "
+              f"{(out.stdout + out.stderr).strip()}", file=sys.stderr)
+        return 1
+    print(f"digest sent: {out.stdout.strip()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

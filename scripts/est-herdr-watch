@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""est-herdr-watch: the herdr mirror — snapshots plus instant pushes.
+
+A supervisor daemon (launchd KeepAlive — see the plist next to the
+backup timer). Discovery lists agents every DISCOVER_S and pushes one
+snapshot per pane (`agents push`): status, title, cwd, workspace/tab
+placing, and a tail of the pane's recent output. Panes that closed
+get deleted, so the hub mirrors herdr exactly — working, done, idle,
+blocked, gone.
+For each WORKING agent with no live waiter it spawns `herdr agent
+wait <pane> --until done --until idle --until blocked`, which returns
+the moment herdr sees the state change — the event itself is never
+polled. On settle it waits SETTLE_S, re-checks (mid-task flicker
+stays quiet), mirrors the fresh snapshot, and fires one broadcast
+`notify send`:
+
+  done/idle     -> "{space * tab} finished" (only when the pane
+                   worked 90s+ first — shorter bursts are status flicker
+                   and stay quiet; the mirror still updates every time)
+  blocked       -> "{space * tab} needs input" (always — a question is
+                   urgent however short the working phase was)
+  newly working -> "{space * tab} started" (never on the first cycle,
+                   so restarts stay quiet)
+
+The push identity is the placing first (terminal titles go stale),
+then the title, the cwd leaf, the pane; the body carries the title
+for flavor plus the pane id.
+
+Vanished panes delete quietly (closing a pane is normal); wait errors
+stay quiet too. Agents already idle at startup never notify — a
+waiter only ever follows a working -> settled transition.
+
+Every subprocess call carries a timeout (a hung ssh or herdr never
+freezes the loop), and each discovery round pushes its snapshots in
+parallel. The daemon also tends its own liveness: it beats the
+`herdr-watch` heartbeat check every few minutes (a day of silence
+pages — the Mac sleeps nightly, so the horizon is 24h, not minutes),
+it self-reports when herdr itself goes unreachable, and it nudges
+once when a working pane's output sits unchanged past STUCK_AFTER_S.
+
+Note: the loaded timer runs the COPY in ~/.local/bin (launchd cannot
+read ~/Desktop) — re-copy after editing, then unload/load.
+
+  ./scripts/est-herdr-watch            # daemon (logs to stderr)
+  ./scripts/est-herdr-watch --dry-run  # discovery only, no pushes
+  EST_HUB_SSH= ./scripts/est-herdr-watch  # local dev, no ssh hop
+"""
+
+import concurrent.futures
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+HUB = os.environ.get("EST_HUB_URL", "http://100.120.126.23:18925")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.environ.get(
+    "EST_HUB_BIN",
+    os.path.join(os.path.dirname(ROOT), ".target", "debug", "est-hub"),
+)
+# The Mac has no tailnet route here, so the hub
+# CLI rides ssh. Empty disables the hop (local dev).
+SSH = os.environ.get("EST_HUB_SSH", "vps2")
+DISCOVER_S = 15  # new rows, titles, vanish deletes; events are instant
+SETTLE_S = 10  # re-check delay: mid-task flicker stays quiet
+WORKING_MIN_S = 90  # a settle buzzes only after this much continuous
+# working — real completions buzz every time, status flicker never
+OUTPUT_LINES = 40  # `agent read` window per pane per cycle
+OUTPUT_CHARS = 2000  # stored tail (the hub caps at 4096)
+SSH_TIMEOUT_S = 30  # one hub call never holds the loop past this
+HERDR_TIMEOUT_S = 15  # local herdr calls answer fast or not at all
+PUSH_WORKERS = 8  # parallel snapshot pushes per discovery round
+HEARTBEAT_EVERY_CYCLES = 20  # beat `herdr-watch` every ~5min
+HERDR_ALERT_STREAK = 4  # consecutive failed lists before self-report
+HERDR_ALERT_COOLDOWN_S = 3600  # one herdr-down push per hour max
+STUCK_AFTER_S = 1800  # working with an unchanged tail past this nudges
+
+working_since = {}  # pane_id -> monotonic it (re)entered working
+settling = set()  # panes with a settle in flight (waiter/fast-path dedupe)
+settling_lock = threading.Lock()
+stuck_seen = {}  # pane_id -> (output hash, monotonic): the stuck watch
+stuck_nudged = set()  # (pane_id, output hash) already nudged
+
+
+def log(msg):
+    stamp = time.strftime("%H:%M:%S")
+    print(f"est-herdr-watch [{stamp}]: {msg}", file=sys.stderr, flush=True)
+
+
+def proc(cmd, timeout):
+    """One subprocess call with a timeout. Returns (code, output); a
+    hung child reads 124, never a frozen loop."""
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    return out.returncode, (out.stdout + out.stderr).strip()
+
+
+def run(*args):
+    if SSH:
+        remote = " ".join(shlex.quote(a) for a in ("est-hub",) + args)
+        return proc(["ssh", "-n", SSH, remote], SSH_TIMEOUT_S)
+    return proc(list((BIN,) + args), SSH_TIMEOUT_S)
+
+
+def agent_list():
+    code, out = proc(["herdr", "agent", "list"], HERDR_TIMEOUT_S)
+    if code != 0:
+        raise RuntimeError(out)
+    return json.loads(out)["result"]["agents"]
+
+
+def agent_get(pane_id):
+    code, out = proc(["herdr", "agent", "get", pane_id], HERDR_TIMEOUT_S)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)["result"]["agent"]
+    except (KeyError, ValueError):
+        return None
+
+
+def label(agent, spaces=None):
+    """Push identity: `space * tab` placing first (terminal titles go
+    stale — the placing never lies), then the title, the cwd leaf, the
+    pane. `spaces` is topology() (or None to skip placing)."""
+    if spaces is not None:
+        ws_map, tab_map = spaces
+        placing = " * ".join(
+            p for p in (ws_map.get(agent.get("workspace_id", ""), ""),
+                        tab_map.get(agent.get("tab_id", ""), "")) if p)
+        if placing:
+            return placing
+    title = (agent.get("terminal_title_stripped", "") or "").strip()
+    if title:
+        return title
+    cwd = (agent.get("cwd", "") or "").strip().rstrip("/")
+    if cwd:
+        return cwd.rsplit("/", 1)[-1]
+    return agent.get("pane_id", "agent")
+
+
+def push_body(agent, name):
+    """Push body: the terminal title for flavor plus the pane id. When
+    the title already is the push title (placing missing), the pane
+    alone carries it."""
+    title = (agent.get("terminal_title_stripped", "") or "").strip()
+    pane = agent.get("pane_id", "?")
+    if not title or title == name:
+        return pane
+    return f"{title} · {pane}"
+
+
+def topology():
+    """Workspace/tab labels: ({ws_id: label}, {tab_id: label}).
+
+    Herdr answers JSON; anything unparseable reads empty (the push
+    omits placing then, and the hub keeps the last values).
+    """
+    spaces, tabs = {}, {}
+    code, out = proc(["herdr", "workspace", "list"], HERDR_TIMEOUT_S)
+    if code != 0:
+        return spaces, tabs
+    try:
+        workspaces = json.loads(out)["result"]["workspaces"]
+    except (KeyError, ValueError):
+        return spaces, tabs
+    for ws in workspaces:
+        wid = ws.get("workspace_id", "")
+        if not wid:
+            continue
+        if ws.get("label"):
+            spaces[wid] = ws["label"]
+        tcode, tout = proc(
+            ["herdr", "tab", "list", "--workspace", wid], HERDR_TIMEOUT_S)
+        if tcode != 0:
+            continue
+        try:
+            for tab in json.loads(tout)["result"]["tabs"]:
+                if tab.get("tab_id") and tab.get("label"):
+                    tabs[tab["tab_id"]] = tab["label"]
+        except (KeyError, ValueError):
+            continue
+    return spaces, tabs
+
+
+def read_output(pane_id):
+    """Tail of the pane's recent output (plain text, capped).
+
+    Blank on any failure — the push omits output then, and the hub
+    keeps the last tail.
+    """
+    code, out = proc(
+        ["herdr", "agent", "read", pane_id,
+         "--source", "recent-unwrapped", "--lines", str(OUTPUT_LINES)],
+        HERDR_TIMEOUT_S)
+    if code != 0:
+        return ""
+    return out.strip()[-OUTPUT_CHARS:]
+
+
+def push_snapshot(agent, spaces):
+    """Mirror one pane to the hub. Failures log; the next cycle retries.
+
+    `spaces` is topology() — placing/reads resolve here, omitted when
+    unknown so the hub keeps the last values. Returns the tail it read
+    (possibly empty) for the stuck watch.
+    """
+    pane = agent.get("pane_id", "")
+    status = agent.get("agent_status", "unknown") or "unknown"
+    title = (agent.get("terminal_title_stripped", "") or "").strip()
+    cwd = (agent.get("cwd", "") or "").strip()
+    ws_map, tab_map = spaces
+    space = ws_map.get(agent.get("workspace_id", ""), "")
+    tab = tab_map.get(agent.get("tab_id", ""), "")
+    output = read_output(pane) if pane else ""
+    args = ["agents", "push", pane, "--status", status, "--hub", HUB]
+    if title:
+        args += ["--title", title]
+    if cwd:
+        args += ["--cwd", cwd]
+    if space:
+        args += ["--space", space]
+    if tab:
+        args += ["--tab", tab]
+    if output:
+        args += ["--output", output]
+    code, err = run(*args)
+    if code != 0:
+        log(f"snapshot push failed for {pane}: {err}")
+    return output
+
+
+def delete_snapshot(pane):
+    code, err = run("agents", "delete", pane, "--yes", "--hub", HUB)
+    if code != 0:
+        log(f"snapshot delete failed for {pane}: {err}")
+    else:
+        log(f"deleted snapshot for closed pane {pane}")
+
+
+def hub_panes():
+    """Panes the hub currently mirrors (boot reconcile only)."""
+    code, out = run("agents", "list", "--hub", HUB, "--json")
+    if code != 0:
+        log(f"reconcile list failed: {out}")
+        return None
+    try:
+        agents = json.loads(out)["agents"]
+    except (KeyError, ValueError) as e:
+        log(f"reconcile list unparseable: {e}")
+        return None
+    return {a.get("pane", "") for a in agents if a.get("pane")}
+
+
+def notify_finished(agent, spaces=None):
+    name = label(agent, spaces)
+    pane = agent.get("pane_id", "?")
+    code, err = run(
+        "notify", "send", "--title", f"{name} finished",
+        "--body", push_body(agent, name),
+        "--hub", HUB,
+    )
+    if code != 0:
+        log(f"notify failed for {pane}: {err}")
+    else:
+        log(f"pushed finished for {pane} ({name})")
+
+
+def notify_blocked(agent, spaces=None):
+    name = label(agent, spaces)
+    pane = agent.get("pane_id", "?")
+    code, err = run(
+        "notify", "send", "--title", f"{name} needs input",
+        "--body", push_body(agent, name),
+        "--hub", HUB,
+    )
+    if code != 0:
+        log(f"notify failed for {pane}: {err}")
+    else:
+        log(f"pushed needs-input for {pane} ({name})")
+
+
+def notify_started(agent, spaces=None):
+    name = label(agent, spaces)
+    pane = agent.get("pane_id", "?")
+    code, err = run(
+        "notify", "send", "--title", f"{name} started",
+        "--body", push_body(agent, name),
+        "--hub", HUB,
+    )
+    if code != 0:
+        log(f"notify failed for {pane}: {err}")
+    else:
+        log(f"pushed started for {pane} ({name})")
+
+
+def notify_stuck(agent, spaces=None):
+    name = label(agent, spaces)
+    pane = agent.get("pane_id", "?")
+    code, err = run(
+        "notify", "send", "--title", f"{name} might be stuck",
+        "--body", f"working 30m, no new output · {pane}",
+        "--hub", HUB,
+    )
+    if code != 0:
+        log(f"notify failed for {pane}: {err}")
+    else:
+        log(f"pushed stuck-nudge for {pane} ({name})")
+
+
+def notify_herdr(down):
+    title = "herdr unreachable" if down else "herdr back"
+    body = "agent list failing on Mac" if down else "agent list recovered"
+    code, err = run(
+        "notify", "send", "--title", title, "--body", body, "--hub", HUB)
+    if code != 0:
+        log(f"herdr self-report failed: {err}")
+    else:
+        log(f"pushed herdr self-report ({title})")
+
+
+def ensure_heartbeat():
+    """Seed the `herdr-watch` heartbeat once: beats every ~5min, pages
+    after a day of silence (the Mac sleeps nightly — minutes would lie)."""
+    code, _ = run("checks", "show", "herdr-watch", "--hub", HUB)
+    if code == 0:
+        return
+    code, err = run(
+        "checks", "add", "herdr-watch",
+        "--type", "heartbeat", "--target", "mac",
+        "--owner", "sys", "--every", "300", "--miss-after", "86400",
+        "--hub", HUB,
+    )
+    if code != 0:
+        log(f"heartbeat ensure failed: {err}")
+
+
+def beat_heartbeat():
+    code, err = run("heartbeats", "beat", "--check", "herdr-watch",
+                    "--hub", HUB)
+    if code != 0:
+        log(f"heartbeat beat failed: {err}")
+
+
+def stuck_watch(agent, output, now, spaces=None):
+    """Nudge once when a working pane's tail sits unchanged past
+    STUCK_AFTER_S. Empty tails never nudge (a failing `agent read`
+    reads empty — that path must stay quiet, not cry stuck)."""
+    pane = agent.get("pane_id", "")
+    if not pane or not output:
+        return
+    digest = hashlib.sha256(output.encode()).hexdigest()
+    prev = stuck_seen.get(pane)
+    if prev is None or prev[0] != digest:
+        stuck_seen[pane] = (digest, now)
+        return
+    if now - prev[1] >= STUCK_AFTER_S and (pane, digest) not in stuck_nudged:
+        stuck_nudged.add((pane, digest))
+        notify_stuck(agent, spaces)
+
+
+def settle_async(pane_id, meta):
+    """Settle in the background so one pane's re-check never stalls
+    the loop (or a sibling's push). Second callers for a pane already
+    settling are dropped — the waiter and the discovery net race, and
+    exactly one of them runs."""
+
+    def run():
+        try:
+            settle(pane_id, meta)
+        finally:
+            with settling_lock:
+                settling.discard(pane_id)
+
+    with settling_lock:
+        if pane_id in settling:
+            return
+        settling.add(pane_id)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def settle(pane_id, meta):
+    """Waiter exited: re-check after SETTLE_S; if still settled, push
+    first, then mirror the fresh state."""
+    time.sleep(SETTLE_S)
+    agent = agent_get(pane_id)
+    if agent is None:
+        log(f"{pane_id} vanished; quiet")
+        return
+    status = agent.get("agent_status", "unknown")
+    if status == "working":
+        log(f"{pane_id} working again; quiet (flicker)")
+        return
+    agent.setdefault("pane_id", pane_id)
+    # Keep the waiter's title if the fresh read lost it.
+    if not (agent.get("terminal_title_stripped", "") or "").strip():
+        agent["terminal_title_stripped"] = meta.get("title", "")
+    if not (agent.get("cwd", "") or "").strip():
+        agent["cwd"] = meta.get("cwd", "")
+    # The push first, the mirror after: the buzz is urgent, the row
+    # follows seconds later (and discovery refreshes it anyway).
+    topo = topology()
+    if status == "blocked":
+        notify_blocked(agent, topo)
+    else:
+        worked = time.monotonic() - working_since.get(pane_id, 0.0)
+        if worked < WORKING_MIN_S:
+            log(f"{pane_id} settled after {worked:.0f}s working; "
+                f"quiet (flicker)")
+        else:
+            notify_finished(agent, topo)
+    push_snapshot(agent, topo)
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    if not SSH and not os.path.isfile(BIN):
+        print(f"est-herdr-watch: no hub binary at {BIN}", file=sys.stderr)
+        return 1
+    waiters = {}  # pane_id -> (Popen, meta)
+    known = set()  # panes seen this run (started pushes + vanish deletes)
+    last_status = {}  # pane_id -> status at the last discovery (net below)
+    first_cycle = True
+    cycle = 0  # discovery rounds (the heartbeat beats off this)
+    fail_streak = 0  # consecutive failed agent lists (herdr self-report)
+    herdr_alerted = False
+    herdr_alerted_at = 0.0
+    last_discover = 0.0
+    log("started" + (" (dry run)" if dry_run else ""))
+    while True:
+        now = time.monotonic()
+        if now - last_discover >= DISCOVER_S:
+            last_discover = now
+            try:
+                agents = agent_list()
+            except (RuntimeError, ValueError) as e:
+                log(f"agent list failed: {e}")
+                agents = None
+            if dry_run:
+                ws_map, tab_map = topology()
+                for a in agents or []:
+                    space = ws_map.get(a.get("workspace_id", ""), "?")
+                    tab = tab_map.get(a.get("tab_id", ""), "?")
+                    out = read_output(a.get("pane_id", ""))
+                    print(f"would mirror: {a.get('pane_id')} "
+                          f"({a.get('agent_status')}) {space} * {tab} * "
+                          f"{label(a)} +{len(out)} chars")
+                return 0
+            if agents is None:
+                # Herdr hiccup: keep the last mirror, keep waiters. A
+                # streak becomes a self-report (recovery buzzes back).
+                fail_streak += 1
+                if fail_streak >= HERDR_ALERT_STREAK and \
+                        now - herdr_alerted_at >= HERDR_ALERT_COOLDOWN_S:
+                    herdr_alerted, herdr_alerted_at = True, now
+                    notify_herdr(True)
+                continue
+            if herdr_alerted:
+                herdr_alerted = False
+                notify_herdr(False)
+            fail_streak = 0
+            if first_cycle:
+                ensure_heartbeat()
+                # Boot reconcile: rows for panes herdr no longer lists
+                # are leftovers from before the restart — delete them.
+                hub = hub_panes()
+                if hub is not None:
+                    live = {a.get("pane_id", "") for a in agents}
+                    for pane in sorted(hub - live):
+                        delete_snapshot(pane)
+            if cycle % HEARTBEAT_EVERY_CYCLES == 0:
+                beat_heartbeat()
+            cycle += 1
+            live = set()
+            spaces = topology()
+            snap_agents = [a for a in agents if a.get("pane_id", "")]
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=PUSH_WORKERS) as ex:
+                tails = list(ex.map(
+                    lambda a: push_snapshot(a, spaces), snap_agents))
+            for a, tail in zip(snap_agents, tails):
+                pane = a.get("pane_id", "")
+                live.add(pane)
+                status = a.get("agent_status", "unknown") or "unknown"
+                if pane not in known and not first_cycle \
+                        and status == "working":
+                    notify_started(a, spaces)
+                # Safety net: a working -> settled flip the waiter missed
+                # (it settles in the respawn gap) still settles here. The
+                # waiter wins the race when alive; the guard dedupes.
+                if not first_cycle and last_status.get(pane) == "working" \
+                        and status in ("done", "idle", "blocked", "unknown"):
+                    log(f"{pane} flipped {status} unseen by its waiter; settling")
+                    settle_async(pane, {
+                        "title": (a.get("terminal_title_stripped", "") or ""),
+                        "cwd": (a.get("cwd", "") or ""),
+                    })
+                prev = last_status.get(pane)
+                if status == "working" and prev != "working":
+                    # First-cycle working panes seed long: a restart must
+                    # not silence a genuine completion.
+                    working_since[pane] = now - 3600 if first_cycle else now
+                elif status != "working":
+                    working_since.pop(pane, None)
+                last_status[pane] = status
+                if status == "working":
+                    stuck_watch(a, tail, now, spaces)
+                else:
+                    stuck_seen.pop(pane, None)
+                if status != "working":
+                    continue
+                proc, _ = waiters.get(pane, (None, None))
+                if proc is not None and proc.poll() is None:
+                    continue
+                try:
+                    proc = subprocess.Popen(
+                        ["herdr", "agent", "wait", pane,
+                         "--until", "done", "--until", "idle",
+                         "--until", "blocked"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except OSError as e:
+                    log(f"wait spawn failed for {pane}: {e}")
+                    continue
+                waiters[pane] = (proc, {
+                    "title": (a.get("terminal_title_stripped", "") or ""),
+                    "cwd": (a.get("cwd", "") or ""),
+                })
+                log(f"watching {pane} ({label(a, spaces)})")
+            for pane in sorted(known - live):
+                delete_snapshot(pane)
+                stuck_seen.pop(pane, None)
+                working_since.pop(pane, None)
+            stuck_nudged.intersection_update(
+                {(p, h) for (p, h) in stuck_nudged if p in live})
+            known = live
+            first_cycle = False
+        for pane, (proc, meta) in list(waiters.items()):
+            if proc.poll() is None:
+                continue
+            del waiters[pane]
+            if proc.returncode != 0:
+                log(f"{pane} waiter exited {proc.returncode}; quiet")
+                continue
+            log(f"{pane} waiter fired; re-checking in {SETTLE_S}s")
+            settle_async(pane, meta)
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

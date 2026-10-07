@@ -10,11 +10,19 @@ values (see `est-vault push --verify`), never as the store.
 
 - At rest: one SQLite file, `0700` dir, WAL mode; no secret bytes in
   the schema by design (tokens referenced, values never stored).
-- In motion: plain HTTP, bound to the tailnet IP only — WireGuard is
-  the encryption. The bind address is the access control; `0.0.0.0`
-  is a deployment bug, and deploy checks refuse it.
-- Devices: paired keys only (see the pairing design); revocation is
-  deleting a key. Lost phone: revoke, re-pair.
+- In motion, one listener: plain HTTP on the tailnet IP only (18925 —
+  WireGuard is the encryption; `0.0.0.0` is a deployment bug, and
+  deploy checks refuse it). Access control is Tailscale membership:
+  no public ingress, no client certificates, no owner-vs-device route
+  split. The phone is a tailnet node; its HTTPS endpoint is
+  `tailscale serve` on the hub host, with the certificate owned by
+  Tailscale and no TLS code in the hub.
+- Devices: a device is a name plus its reported push state. It
+  registers itself (`PUT /devices/{name}` upserts over the tailnet);
+  there is no ticket, no compare code, and no client certificate.
+  Revocation is deleting the row (`devices revoke`), which also drops
+  its Live Activity tokens and last-push stamp. Lost phone: revoke,
+  reconnect from the new device.
 - Push: APNs carries full alert text and Live Activity state (decided
   2026-10-06: notification content transits Apple over TLS so alerts
   arrive with the app closed and no VPN). The vault master key and raw
